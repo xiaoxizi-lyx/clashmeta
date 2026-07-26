@@ -1,0 +1,66 @@
+name: Auto Sync with Upstream Meta
+
+on:
+  schedule:
+    # 每天 UTC 06:00（北京时间 14:00）自动运行
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    # 支持手动在 Actions 页面点击触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Meta
+        uses: actions/checkout@v6
+        with:
+          ref: Meta
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream Meta
+        run: |
+          git remote add upstream https://github.com/MetaCubeX/mihomo.git
+          git fetch upstream Meta
+
+      - name: Check if sync is needed
+        id: check
+        run: |
+          UPSTREAM_SHA=$(git rev-parse upstream/Meta)
+          # merge-base 即我们自己的 commit 所基于的 upstream commit
+          MERGE_BASE=$(git merge-base HEAD upstream/Meta)
+
+          echo "upstream/Meta: $UPSTREAM_SHA"
+          echo "merge-base:    $MERGE_BASE"
+
+          if [ "$UPSTREAM_SHA" = "$MERGE_BASE" ]; then
+            echo "already up-to-date"
+            echo "up_to_date=true" >> $GITHUB_OUTPUT
+          else
+            echo "update needed"
+            echo "up_to_date=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Rebase onto upstream Meta
+        if: steps.check.outputs.up_to_date == 'false'
+        run: |
+          if ! git rebase upstream/Meta; then
+            echo "::error::Rebase 冲突，需要本地手动 rebase 后 force-push，本次不做任何改动"
+            git rebase --abort
+            exit 1
+          fi
+          echo "Rebase completed successfully"
+
+      - name: Force push to origin
+        if: steps.check.outputs.up_to_date == 'false'
+        run: |
+          git push --force-with-lease origin Meta
+          echo "Pushed to origin/Meta"
