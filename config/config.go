@@ -371,16 +371,17 @@ type RawGeoXUrl struct {
 }
 
 type RawSniffer struct {
-	Enable          bool     `yaml:"enable" json:"enable"`
-	OverrideDest    bool     `yaml:"override-destination" json:"override-destination"`
-	Sniffing        []string `yaml:"sniffing" json:"sniffing"`
-	ForceDomain     []string `yaml:"force-domain" json:"force-domain"`
-	SkipSrcAddress  []string `yaml:"skip-src-address" json:"skip-src-address"`
-	SkipDstAddress  []string `yaml:"skip-dst-address" json:"skip-dst-address"`
-	SkipDomain      []string `yaml:"skip-domain" json:"skip-domain"`
-	Ports           []string `yaml:"port-whitelist" json:"port-whitelist"`
-	ForceDnsMapping bool     `yaml:"force-dns-mapping" json:"force-dns-mapping"`
-	ParsePureIp     bool     `yaml:"parse-pure-ip" json:"parse-pure-ip"`
+	Enable              bool     `yaml:"enable" json:"enable"`
+	OverrideDest        bool     `yaml:"override-destination" json:"override-destination"`
+	Sniffing            []string `yaml:"sniffing" json:"sniffing"`
+	ForceDomain         []string `yaml:"force-domain" json:"force-domain"`
+	SkipSrcAddress      []string `yaml:"skip-src-address" json:"skip-src-address"`
+	SkipDstAddress      []string `yaml:"skip-dst-address" json:"skip-dst-address"`
+	SkipDomain          []string `yaml:"skip-domain" json:"skip-domain"`
+	ForceOverrideDomain []string `yaml:"force-override-domain" json:"force-override-domain"`
+	Ports               []string `yaml:"port-whitelist" json:"port-whitelist"`
+	ForceDnsMapping     bool     `yaml:"force-dns-mapping" json:"force-dns-mapping"`
+	ParsePureIp         bool     `yaml:"parse-pure-ip" json:"parse-pure-ip"`
 
 	Sniff map[string]RawSniffingConfig `yaml:"sniff" json:"sniff"`
 }
@@ -586,14 +587,15 @@ func DefaultRawConfig() *RawConfig {
 			GeoSite: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat",
 		},
 		Sniffer: RawSniffer{
-			Enable:          false,
-			Sniff:           map[string]RawSniffingConfig{},
-			ForceDomain:     []string{},
-			SkipDomain:      []string{},
-			Ports:           []string{},
-			ForceDnsMapping: true,
-			ParsePureIp:     true,
-			OverrideDest:    true,
+			Enable:              false,
+			Sniff:               map[string]RawSniffingConfig{},
+			ForceDomain:         []string{},
+			SkipDomain:          []string{},
+			ForceOverrideDomain: []string{},
+			Ports:               []string{},
+			ForceDnsMapping:     true,
+			ParsePureIp:         true,
+			OverrideDest:        true,
 		},
 		ExternalUIURL: "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip",
 		ExternalControllerCors: RawCors{
@@ -1853,6 +1855,12 @@ func parseSniffer(snifferRaw RawSniffer, ruleProviders map[string]P.RuleProvider
 		return nil, err
 	}
 	snifferConfig.SkipDomain = skipDomain
+
+	forceOverrideDomain, err := parseDomain(snifferRaw.ForceOverrideDomain, nil, "sniffer.force-override-domain", ruleProviders)
+	if err != nil {
+		return nil, fmt.Errorf("error in force-override-domain, error:%w", err)
+	}
+	snifferConfig.ForceOverrideDomain = forceOverrideDomain
 
 	return snifferConfig, nil
 }
