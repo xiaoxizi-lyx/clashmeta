@@ -1,0 +1,105 @@
+name: Build ARM64
+
+on:
+  workflow_dispatch:
+    # 仅支持手动触发
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-download-base-url: "https://github.com/MetaCubeX/go/releases/download/build"
+          go-version: "1.26"
+
+      - name: Set variables
+        run: |
+          VERSION="${GITHUB_REF_NAME,,}-$(git rev-parse --short HEAD)"
+          VERSION="${VERSION//\//-}"
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "BUILDTIME=$(date -u)" >> $GITHUB_ENV
+
+      - name: Setup UPX
+        run: |
+          wget -q https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-amd64_linux.tar.xz
+          tar xf upx-4.2.4-amd64_linux.tar.xz
+          echo "upx=${{ github.workspace }}/upx-4.2.4-amd64_linux/upx" >> $GITHUB_ENV
+
+      - name: Build (with gvisor)
+        env:
+          GOOS: linux
+          GOARCH: arm64
+          CGO_ENABLED: 0
+        run: |
+          mkdir -p bin
+          go build -tags "with_gvisor" -trimpath \
+            -ldflags "-X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' \
+                      -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' \
+                      -w -s -buildid=" \
+            -o ./bin/clash-gvisor
+          chmod +x ./bin/clash-gvisor
+          ${upx} --lzma --best ./bin/clash-gvisor || true
+          mv ./bin/clash-gvisor ./bin/clash
+          tar -zcvf ./bin/clash-linux-arm64-gvisor-${VERSION}.tar.gz -C ./bin clash
+          rm ./bin/clash
+
+      - name: Build (without gvisor)
+        env:
+          GOOS: linux
+          GOARCH: arm64
+          CGO_ENABLED: 0
+        run: |
+          go build -trimpath \
+            -ldflags "-X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' \
+                      -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' \
+                      -w -s -buildid=" \
+            -o ./bin/clash
+          chmod +x ./bin/clash
+          ${upx} --lzma --best ./bin/clash || true
+          tar -zcvf ./bin/clash-linux-arm64-${VERSION}.tar.gz -C ./bin clash
+          rm ./bin/clash
+
+      - name: Delete old release assets
+        continue-on-error: true
+        uses: 8Mi-Tech/delete-release-assets-action@main
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          tag: build-${{ github.ref_name }}
+          deleteOnlyFromDrafts: false
+
+      - name: Update tag
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git tag -f "build-${{ github.ref_name }}"
+          git push origin "build-${{ github.ref_name }}" --force
+
+      - name: Upload Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: build-${{ github.ref_name }}
+          files: bin/clash-linux-arm64-*.tar.gz
+          prerelease: true
+          name: Build ${{ github.ref_name }}
+          body: |
+            Manual build for **linux/arm64 (aarch64)**.
+
+            | 文件 | 说明 |
+            |------|------|
+            | `clash-linux-arm64-gvisor-*.tar.gz` | 含 TUN 模式支持（with_gvisor） |
+            | `clash-linux-arm64-*.tar.gz` | 精简版，不含 gvisor |
+
+            - `CGO_ENABLED=0` 纯静态链接
+            - 移除调试信息 (`-w -s`)
+            - UPX `--lzma --best` 极限压缩
+
+            Commit: `${{ github.sha }}`
