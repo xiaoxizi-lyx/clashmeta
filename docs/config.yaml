@@ -222,6 +222,10 @@ sniffer:
   ## 对嗅探结果进行跳过
   # skip-domain:
   #   - Mijia Cloud
+  ## 若嗅探结果命中此列表，则无视 override-destination（全局及 sniffer.sniff 协议级）配置，
+  ## 强制使用嗅探结果作为实际访问，优先级低于 skip-domain
+  # force-override-domain:
+  #   - +.example.com
   # 需要嗅探协议
   # 已废弃，若 sniffer.sniff 配置则此项无效
   sniffing:

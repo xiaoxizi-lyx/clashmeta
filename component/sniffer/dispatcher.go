@@ -27,15 +27,16 @@ var (
 const maxSniffBufferSize = 64 * 1024
 
 type Dispatcher struct {
-	enable          bool
-	sniffers        []configuredSniffer
-	forceDomain     []C.DomainMatcher
-	skipSrcAddress  []C.IpMatcher
-	skipDstAddress  []C.IpMatcher
-	skipDomain      []C.DomainMatcher
-	skipList        *lru.LruCache[netip.AddrPort, uint8]
-	forceDnsMapping bool
-	parsePureIp     bool
+	enable              bool
+	sniffers            []configuredSniffer
+	forceDomain         []C.DomainMatcher
+	skipSrcAddress      []C.IpMatcher
+	skipDstAddress      []C.IpMatcher
+	skipDomain          []C.DomainMatcher
+	forceOverrideDomain []C.DomainMatcher
+	skipList            *lru.LruCache[netip.AddrPort, uint8]
+	forceDnsMapping     bool
+	parsePureIp         bool
 }
 
 // configuredSniffer keeps protocol-specific behavior and policy together so
@@ -93,7 +94,7 @@ func (sd *Dispatcher) UDPSniff(packet C.PacketAdapter, packetSender C.PacketSend
 				if inWhitelist {
 					replaceDomain := func(metadata *C.Metadata, host string) {
 						if sd.domainCanReplace(host) {
-							replaceDomain(metadata, host, overrideDest)
+							replaceDomain(metadata, host, overrideDest || sd.forceOverrideDest(host))
 						} else {
 							log.Debugln("[Sniffer] Skip sni[%s]", host)
 						}
@@ -160,7 +161,7 @@ func (sd *Dispatcher) TCPSniff(conn *N.BufferedConn, metadata *C.Metadata) bool 
 
 		sd.skipList.Delete(dst)
 
-		replaceDomain(metadata, host, config.OverrideDest)
+		replaceDomain(metadata, host, config.OverrideDest || sd.forceOverrideDest(host))
 		return true
 	}
 	return false
@@ -194,6 +195,18 @@ func (sd *Dispatcher) domainCanReplace(host string) bool {
 
 func isValidSniffHost(host string) bool {
 	return host != "." && metadata.IsDomainName(host)
+}
+
+// forceOverrideDest reports whether the sniffed host matches force-override-domain,
+// which forces the destination to be overridden regardless of any override-destination settings.
+func (sd *Dispatcher) forceOverrideDest(host string) bool {
+	for _, matcher := range sd.forceOverrideDomain {
+		if matcher.MatchDomain(host) {
+			log.Debugln("[Sniffer] Force override destination for domain [%s]", host)
+			return true
+		}
+	}
+	return false
 }
 
 func (sd *Dispatcher) Enable() bool {
@@ -309,27 +322,29 @@ func (sd *Dispatcher) cacheSniffFailed(metadata *C.Metadata) {
 }
 
 type Config struct {
-	Enable          bool
-	Sniffers        map[sniffer.Type]SnifferConfig
-	ForceDomain     []C.DomainMatcher
-	SkipSrcAddress  []C.IpMatcher
-	SkipDstAddress  []C.IpMatcher
-	SkipDomain      []C.DomainMatcher
-	ForceDnsMapping bool
-	ParsePureIp     bool
+	Enable              bool
+	Sniffers            map[sniffer.Type]SnifferConfig
+	ForceDomain         []C.DomainMatcher
+	SkipSrcAddress      []C.IpMatcher
+	SkipDstAddress      []C.IpMatcher
+	SkipDomain          []C.DomainMatcher
+	ForceOverrideDomain []C.DomainMatcher
+	ForceDnsMapping     bool
+	ParsePureIp         bool
 }
 
 func NewDispatcher(snifferConfig *Config) (*Dispatcher, error) {
 	dispatcher := Dispatcher{
-		enable:          snifferConfig.Enable,
-		forceDomain:     snifferConfig.ForceDomain,
-		skipSrcAddress:  snifferConfig.SkipSrcAddress,
-		skipDstAddress:  snifferConfig.SkipDstAddress,
-		skipDomain:      snifferConfig.SkipDomain,
-		skipList:        lru.New(lru.WithSize[netip.AddrPort, uint8](128), lru.WithAge[netip.AddrPort, uint8](600)),
-		forceDnsMapping: snifferConfig.ForceDnsMapping,
-		parsePureIp:     snifferConfig.ParsePureIp,
-		sniffers:        make([]configuredSniffer, 0, len(snifferConfig.Sniffers)),
+		enable:              snifferConfig.Enable,
+		forceDomain:         snifferConfig.ForceDomain,
+		skipSrcAddress:      snifferConfig.SkipSrcAddress,
+		skipDstAddress:      snifferConfig.SkipDstAddress,
+		skipDomain:          snifferConfig.SkipDomain,
+		forceOverrideDomain: snifferConfig.ForceOverrideDomain,
+		skipList:            lru.New(lru.WithSize[netip.AddrPort, uint8](128), lru.WithAge[netip.AddrPort, uint8](600)),
+		forceDnsMapping:     snifferConfig.ForceDnsMapping,
+		parsePureIp:         snifferConfig.ParsePureIp,
+		sniffers:            make([]configuredSniffer, 0, len(snifferConfig.Sniffers)),
 	}
 
 	// Configuration is map-based, but protocol order must remain deterministic
