@@ -1,0 +1,383 @@
+# 同步上游 + 编译 UPX 压缩的 linux/arm64 二进制并发布到 Release（本 fork 自用）
+#
+# 流程（每个阶段是一个独立的 job）：
+#   1. sync    ：拉取上游，若有新提交则把本仓库的自定义提交 rebase 到上游之上并强推；
+#                若上游无更新且 Release 里已有当前 commit 的产物则直接结束（手动运行可勾选强制编译）
+#   2. build   ：跑本 fork 自己的测试，CGO_ENABLED=0 编译 linux/arm64（带 / 不带 gvisor）
+#   3. package ：upx --lzma --best 压缩，实际运行一次确认可用，打成 tar.gz
+#   4. release ：把 build-<分支> tag 移到当前 commit，更新预发布里的文件
+#
+# 所有 job 都跑在 arm64 runner 上：测试和压缩后的二进制都在目标架构上原生运行，不需要 qemu。
+#
+# sync 阶段就会推送分支，之后的阶段失败不会回滚分支，但也不会发布；
+# 下一次运行会发现 Release 里缺少当前 commit 的产物，自动重新编译。
+#
+# 可选的 Secret（Settings → Secrets and variables → Actions → Secrets）：
+#   SYNC_TOKEN —— 一个对本仓库有 Contents: Read and write + Workflows: Read and write 权限的
+#                 Fine-grained PAT。上游改动 .github/workflows/ 下的文件时，默认的 GITHUB_TOKEN
+#                 无权推送这类提交；未配置时那一次同步会报错停下，其余情况不受影响。
+
+name: Sync Upstream & Build ARM64
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "上游无更新时也强制编译发布"
+        type: boolean
+        default: false
+  schedule:
+    # 每天 UTC 06:17（北京时间 14:17）。避开整点，整点的定时任务排队延迟最严重
+    - cron: "17 6 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-sync-build
+  cancel-in-progress: false
+
+env:
+  BRANCH: Meta
+  UPSTREAM_REPO: MetaCubeX/mihomo
+  UPSTREAM_BRANCH: Meta
+  # 浮动在上游之上的自定义 commit 数上限，超出说明上游改写了历史，需要人工处理
+  MAX_CUSTOM_COMMITS: 10
+  UPX_VERSION: 4.2.4
+  # arm64_linux 包的校验值，与 runner 架构对应
+  UPX_SHA256: 6bfeae6714e34a82e63245289888719c41fd6af29f749a44ae3d3d166ba6a1c9
+
+jobs:
+  sync:
+    name: Sync with upstream
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: write # 用于每次运行时重新启用本 workflow，刷新 60 天无活动自动停用的计时
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      sha: ${{ steps.decide.outputs.sha }}
+      upstream_sha: ${{ steps.decide.outputs.upstream_sha }}
+      version: ${{ steps.decide.outputs.version }}
+      tag: ${{ steps.decide.outputs.tag }}
+      go_version: ${{ steps.decide.outputs.go_version }}
+      asset_gvisor: ${{ steps.decide.outputs.asset_gvisor }}
+      asset_plain: ${{ steps.decide.outputs.asset_plain }}
+
+    steps:
+      # GitHub 会在仓库 60 天没有活动后停用定时任务；每次运行都调用一次 enable 接口来刷新计时
+      - name: Keep scheduled workflow alive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          workflow_file=$(basename "${GITHUB_WORKFLOW_REF%@*}")
+          if gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_file}/enable"; then
+            echo "已重新启用 ${workflow_file}"
+          else
+            echo "::warning::重新启用 ${workflow_file} 失败，定时任务的停用计时没有刷新（不影响本次同步）"
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Rebase onto upstream
+        id: rebase
+        env:
+          HAS_SYNC_TOKEN: ${{ secrets.SYNC_TOKEN != '' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          upstream="refs/remotes/upstream/${UPSTREAM_BRANCH}"
+          git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" "+refs/heads/${UPSTREAM_BRANCH}:${upstream}"
+
+          old_head=$(git rev-parse HEAD)
+          echo "old_head=${old_head}" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "${upstream}" HEAD; then
+            echo "上游没有新提交（$(git rev-parse --short "${upstream}")）"
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "上游新提交："
+          git log --oneline "HEAD..${upstream}"
+
+          custom=$(git rev-list --count "${upstream}..HEAD")
+          if [ "${custom}" -gt "${MAX_CUSTOM_COMMITS}" ]; then
+            echo "::error::上游之外有 ${custom} 个 commit（上限 ${MAX_CUSTOM_COMMITS}），多半是上游改写了历史，请在本地手动 rebase 后 force-push"
+            exit 1
+          fi
+
+          if ! git rebase "${upstream}"; then
+            conflicts=$(git diff --name-only --diff-filter=U | paste -sd ' ')
+            git rebase --abort
+            echo "::error::Rebase 冲突（${conflicts}），请在本地手动 rebase 到 ${UPSTREAM_REPO}@${UPSTREAM_BRANCH} 并解决冲突后 force-push，本次未做任何改动"
+            exit 1
+          fi
+
+          if [ "${HAS_SYNC_TOKEN}" != "true" ] && ! git diff --quiet "${old_head}" HEAD -- .github/workflows; then
+            echo "::error::本次同步包含上游对 .github/workflows/ 的修改，默认的 GITHUB_TOKEN 无权推送 workflow 文件，请按文件头注释配置 SYNC_TOKEN 后重新运行；或在本地手动 rebase 后 force-push"
+            exit 1
+          fi
+          echo "updated=true" >> "$GITHUB_OUTPUT"
+
+      - name: Push rebased branch
+        if: steps.rebase.outputs.updated == 'true'
+        env:
+          OLD_HEAD: ${{ steps.rebase.outputs.old_head }}
+        run: git push --force-with-lease="${BRANCH}:${OLD_HEAD}" origin "${BRANCH}"
+
+      - name: Decide whether to build
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          UPDATED: ${{ steps.rebase.outputs.updated }}
+          FORCE: ${{ inputs.force_build || false }}
+        run: |
+          version="${BRANCH,,}-$(git rev-parse --short HEAD)"
+          version="${version//\//-}"
+          # 不以 v 开头，避免触发上游 build.yml / test.yml 的 tags: v* 规则
+          tag="build-${BRANCH}"
+          asset_gvisor="clash-linux-arm64-gvisor-${version}.tar.gz"
+          asset_plain="clash-linux-arm64-${version}.tar.gz"
+
+          # 跟随上游 build.yml 默认使用的 Go 版本，上游升级后无需手动同步；解析不到时用兜底值
+          go_version=$(grep -m1 -oP "go-version: ['\"]?\K[0-9]+\.[0-9]+" .github/workflows/build.yml || true)
+          go_version="${go_version:-1.26}"
+
+          build=false
+          if [ "${UPDATED}" = "true" ] || [ "${FORCE}" = "true" ]; then
+            build=true
+          else
+            # 以 Release 里有没有当前 commit 的产物为准，这样本地手动推送、
+            # 上次编译或发布失败等情况，都会在下一次运行时自动补上
+            assets=$(gh release view "${tag}" --json assets --jq '.assets[].name' 2> /dev/null || true)
+            for name in "${asset_gvisor}" "${asset_plain}"; do
+              grep -qxF "${name}" <<< "${assets}" || build=true
+            done
+            if [ "${build}" = "true" ]; then
+              echo "上游无更新，但 Release 里没有当前 commit 的产物（本地推送过或上次运行失败），继续编译"
+            fi
+          fi
+
+          {
+            echo "build=${build}"
+            echo "sha=$(git rev-parse HEAD)"
+            echo "upstream_sha=$(git rev-parse "refs/remotes/upstream/${UPSTREAM_BRANCH}")"
+            echo "version=${version}"
+            echo "tag=${tag}"
+            echo "go_version=${go_version}"
+            echo "asset_gvisor=${asset_gvisor}"
+            echo "asset_plain=${asset_plain}"
+          } | tee -a "$GITHUB_OUTPUT"
+
+          if [ "${build}" != "true" ]; then
+            echo "### 上游无更新，Release 已是最新，跳过编译" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  build:
+    name: Build linux/arm64
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    env:
+      CGO_ENABLED: 0
+      GOTOOLCHAIN: local
+    outputs:
+      buildtime: ${{ steps.build.outputs.buildtime }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+
+      - name: Set up Go
+        # 与上游 build.yml 保持一致：固定到这个 commit 才支持 go-download-base-url
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-download-base-url: "https://github.com/MetaCubeX/go/releases/download/build"
+          go-version: ${{ needs.sync.outputs.go_version }}
+
+      - name: Test fork changes
+        # 只跑本 fork 自己的测试：rebase 没有文本冲突不代表功能还在
+        run: go test -count=1 -run ForceOverride ./component/sniffer/ ./config/
+
+      - name: Embed CA bundle
+        # 与上游 build.yml 一致：仓库里的 ca-certificates.crt 是空占位，编译前才填入
+        run: |
+          sudo apt-get update && sudo apt-get install -y ca-certificates
+          sudo update-ca-certificates
+          cp -f /etc/ssl/certs/ca-certificates.crt component/ca/ca-certificates.crt
+
+      - name: Build
+        id: build
+        env:
+          GOOS: linux
+          GOARCH: arm64
+          VERSION: ${{ needs.sync.outputs.version }}
+        run: |
+          buildtime=$(date -u)
+          echo "buildtime=${buildtime}" >> "$GITHUB_OUTPUT"
+
+          mkdir -p bin
+          build() { # build <go build tags> <output name>
+            go build -tags "$1" -trimpath \
+              -ldflags "-X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' \
+                        -X 'github.com/metacubex/mihomo/constant.BuildTime=${buildtime}' \
+                        -w -s -buildid=" \
+              -o "bin/$2"
+          }
+          build with_gvisor clash-gvisor
+          build "" clash-plain
+          ls -l bin
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: binaries
+          path: bin/
+          if-no-files-found: error
+          retention-days: 1
+
+  package:
+    name: Compress & package
+    needs: [sync, build]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    outputs:
+      gvisor_raw: ${{ steps.package.outputs.gvisor_raw }}
+      gvisor_upx: ${{ steps.package.outputs.gvisor_upx }}
+      plain_raw: ${{ steps.package.outputs.plain_raw }}
+      plain_upx: ${{ steps.package.outputs.plain_upx }}
+
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: binaries
+          path: bin
+
+      - name: Install UPX
+        run: |
+          archive="upx-${UPX_VERSION}-arm64_linux.tar.xz"
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/${archive}"
+          echo "${UPX_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum -c -
+          tar -xf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}"
+          echo "${RUNNER_TEMP}/upx-${UPX_VERSION}-arm64_linux" >> "$GITHUB_PATH"
+
+      - name: Compress and package
+        id: package
+        env:
+          VERSION: ${{ needs.sync.outputs.version }}
+          ASSET_GVISOR: ${{ needs.sync.outputs.asset_gvisor }}
+          ASSET_PLAIN: ${{ needs.sync.outputs.asset_plain }}
+        run: |
+          mkdir -p dist work
+          package() { # package <variant> <asset name>
+            cp "bin/clash-$1" work/clash
+            chmod 755 work/clash # artifact 不保留可执行位
+            echo "$1_raw=$(stat -c %s work/clash)" >> "$GITHUB_OUTPUT"
+
+            upx --lzma --best work/clash
+            upx -t work/clash
+
+            # 实际运行一次，确认压缩后的二进制可用（runner 与目标同为 arm64）
+            out=$(work/clash -v)
+            echo "${out}"
+            grep -qF "${VERSION}" <<< "${out}"
+
+            echo "$1_upx=$(stat -c %s work/clash)" >> "$GITHUB_OUTPUT"
+            tar -zcf "dist/$2" -C work clash
+            rm work/clash
+          }
+          package gvisor "${ASSET_GVISOR}"
+          package plain "${ASSET_PLAIN}"
+          ls -l dist
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: packages
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Release
+    needs: [sync, build, package]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Download packages
+        uses: actions/download-artifact@v8
+        with:
+          name: packages
+          path: dist
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.sync.outputs.tag }}
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
+          BUILDTIME: ${{ needs.build.outputs.buildtime }}
+          ASSET_GVISOR: ${{ needs.sync.outputs.asset_gvisor }}
+          ASSET_PLAIN: ${{ needs.sync.outputs.asset_plain }}
+          GVISOR_RAW: ${{ needs.package.outputs.gvisor_raw }}
+          GVISOR_UPX: ${{ needs.package.outputs.gvisor_upx }}
+          PLAIN_RAW: ${{ needs.package.outputs.plain_raw }}
+          PLAIN_UPX: ${{ needs.package.outputs.plain_upx }}
+        run: |
+          git tag -f "${TAG}"
+          git push -f origin "refs/tags/${TAG}"
+
+          h() { numfmt --to=iec-i --suffix=B --format='%.1f' "$1"; }
+          notes="${RUNNER_TEMP}/release-notes.md"
+          cat > "${notes}" << EOF
+          Automated build for **linux/arm64 (aarch64)**.
+
+          | 文件 | 说明 | 压缩前 | 压缩后 |
+          |------|------|------|------|
+          | \`clash-linux-arm64-gvisor-*.tar.gz\` | 含 TUN 模式支持（with_gvisor） | $(h "${GVISOR_RAW}") | $(h "${GVISOR_UPX}") |
+          | \`clash-linux-arm64-*.tar.gz\` | 精简版，不含 gvisor | $(h "${PLAIN_RAW}") | $(h "${PLAIN_UPX}") |
+
+          - \`CGO_ENABLED=0\` 纯静态链接
+          - 移除调试信息 (\`-w -s\`)
+          - UPX \`--lzma --best\` 极限压缩
+
+          Commit: \`$(git rev-parse HEAD)\`
+          Upstream: ${UPSTREAM_REPO}@${UPSTREAM_SHA}
+          Built at: ${BUILDTIME}
+          EOF
+          cat "${notes}"
+
+          if gh release view "${TAG}" > /dev/null 2>&1; then
+            # 先传新产物再删旧产物，Release 不会出现没有文件的空档
+            gh release upload "${TAG}" "dist/${ASSET_GVISOR}" "dist/${ASSET_PLAIN}" --clobber
+            gh release view "${TAG}" --json assets --jq '.assets[].name' | while read -r name; do
+              [ -e "dist/${name}" ] || gh release delete-asset "${TAG}" "${name}" --yes < /dev/null
+            done
+            gh release edit "${TAG}" --title "Build ${BRANCH}" --notes-file "${notes}" --prerelease
+          else
+            gh release create "${TAG}" "dist/${ASSET_GVISOR}" "dist/${ASSET_PLAIN}" \
+              --title "Build ${BRANCH}" --notes-file "${notes}" --prerelease
+          fi

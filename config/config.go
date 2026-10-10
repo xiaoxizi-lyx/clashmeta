@@ -384,6 +384,9 @@ type RawSniffer struct {
 	ParsePureIp     bool     `yaml:"parse-pure-ip" json:"parse-pure-ip"`
 
 	Sniff map[string]RawSniffingConfig `yaml:"sniff" json:"sniff"`
+
+	// fork-only, kept apart from the upstream fields to avoid rebase conflicts
+	ForceOverrideDomain []string `yaml:"force-override-domain" json:"force-override-domain"`
 }
 
 type RawSniffingConfig struct {
@@ -1855,6 +1858,12 @@ func parseSniffer(snifferRaw RawSniffer, ruleProviders map[string]P.RuleProvider
 		return nil, err
 	}
 	snifferConfig.SkipDomain = skipDomain
+
+	forceOverrideDomain, err := parseDomain(snifferRaw.ForceOverrideDomain, nil, "sniffer.force-override-domain", ruleProviders)
+	if err != nil {
+		return nil, err
+	}
+	snifferConfig.ForceOverrideDomain = forceOverrideDomain
 
 	return snifferConfig, nil
 }

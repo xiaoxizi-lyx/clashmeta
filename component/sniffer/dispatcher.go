@@ -27,6 +27,8 @@ var (
 const maxSniffBufferSize = 64 * 1024
 
 type Dispatcher struct {
+	forceOverrideDomain []C.DomainMatcher // fork-only, see force_override.go
+
 	enable          bool
 	sniffers        []configuredSniffer
 	forceDomain     []C.DomainMatcher
@@ -93,7 +95,7 @@ func (sd *Dispatcher) UDPSniff(packet C.PacketAdapter, packetSender C.PacketSend
 				if inWhitelist {
 					replaceDomain := func(metadata *C.Metadata, host string) {
 						if sd.domainCanReplace(host) {
-							replaceDomain(metadata, host, overrideDest)
+							replaceDomain(metadata, host, overrideDest || sd.forceOverrideDest(host))
 						} else {
 							log.Debugln("[Sniffer] Skip sni[%s]", host)
 						}
@@ -160,7 +162,7 @@ func (sd *Dispatcher) TCPSniff(conn *N.BufferedConn, metadata *C.Metadata) bool 
 
 		sd.skipList.Delete(dst)
 
-		replaceDomain(metadata, host, config.OverrideDest)
+		replaceDomain(metadata, host, config.OverrideDest || sd.forceOverrideDest(host))
 		return true
 	}
 	return false
@@ -309,6 +311,8 @@ func (sd *Dispatcher) cacheSniffFailed(metadata *C.Metadata) {
 }
 
 type Config struct {
+	ForceOverrideDomain []C.DomainMatcher // fork-only, see force_override.go
+
 	Enable          bool
 	Sniffers        map[sniffer.Type]SnifferConfig
 	ForceDomain     []C.DomainMatcher
@@ -331,6 +335,7 @@ func NewDispatcher(snifferConfig *Config) (*Dispatcher, error) {
 		parsePureIp:     snifferConfig.ParsePureIp,
 		sniffers:        make([]configuredSniffer, 0, len(snifferConfig.Sniffers)),
 	}
+	dispatcher.forceOverrideDomain = snifferConfig.ForceOverrideDomain
 
 	// Configuration is map-based, but protocol order must remain deterministic
 	// when multiple sniffers cover the same port.
